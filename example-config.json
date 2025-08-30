@@ -1,0 +1,14 @@
+{
+  "model": {
+    "provider": "anthropic",
+    "name": "claude-sonnet-4-20250514",
+    "max_tokens": 64000
+  },
+  "mcpservers": {
+    "weather" : {
+      "command": "uv",
+      "args": ["--directory", "/Users/rparikh/personal/deepagents/", "run", "sampleserver.py"],
+      "transport": "stdio"
+    }
+ }
+}
