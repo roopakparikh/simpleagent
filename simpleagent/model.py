@@ -3,7 +3,7 @@ import os
 from typing import Optional
 from langchain_anthropic import ChatAnthropic
 from langchain_ollama import ChatOllama
-
+from langchain_core.messages import SystemMessage, HumanMessage
 
 class LLM:
     def __init__(self, provider: str, model_name: str, max_tokens: int):
@@ -24,7 +24,7 @@ class LLM:
     def set_system_prompt(self, system_prompt: str):
         self.system_prompt = system_prompt
 
-    def call_llm(prompt: str, temperature=0.2) -> str:
+    def call_llm(self, prompt: str, temperature=0.2) -> str:
         msgs = [
             SystemMessage(
                 content=(

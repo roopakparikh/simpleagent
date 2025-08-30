@@ -9,6 +9,28 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 
+class CompositeCompleter(Completer):
+    def __init__(self, completers: Dict[str, Completer]):
+        self.completers = completers
+    
+    def get_completions(self, document: Document, complete_event):
+        text = document.text_before_cursor
+        # Find last token boundary (space-separated for simplicity)
+        last_space = text.rfind(" ")
+        token_start = last_space + 1
+        token = text[token_start:]
+        for k, v in self.completers.items():
+            if token.startswith(k):
+                for c in v.get_completions(document, complete_event):
+                    yield c
+        return
+        
+class SystemCompleter(Completer):
+    def get_completions(self, document: Document, complete_event):
+        yield Completion("/exit")
+        yield Completion("/quit")
+        yield Completion("/help")   
+
 class AtPathCompleter(Completer):
     """prompt_toolkit completer that completes filesystem paths when the
     token being completed starts with '@'. The inserted text keeps the '@' prefix.
@@ -96,5 +118,11 @@ def get_prompt_session(root: Optional[str] = None) -> PromptSession:
     If 'root' is provided, it will be used as the base directory for
     path completion; otherwise the current working directory is used.
     """
-    return PromptSession(completer=AtPathCompleter(base_dir=root))
+    path_completer = AtPathCompleter(base_dir=root)
+    system_completer = SystemCompleter()
+    completer = CompositeCompleter({
+        "@": path_completer,
+        "/": system_completer,
+    })
+    return PromptSession(completer=completer)
 

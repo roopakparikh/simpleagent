@@ -13,7 +13,7 @@ from langchain_core.tools import tool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 
-log = logging.getLogger("graph")
+log = logging.getLogger(__name__)
 
 class GraphState(TypedDict, total=False):
     task: str
@@ -25,123 +25,6 @@ class GraphState(TypedDict, total=False):
     done: bool
 
 
-def _node_plan(state: GraphState, llm) -> GraphState:
-    log.debug(f"node_plan: task='{state.get('task','')[:80]}'")
-    prompt = f"""Plan step-by-step to solve the user task.
-        Task: {state.get('task','')}
-        Return JSON: {{"subtasks": ["..."], "tools": {{"search": true/false, "math": true/false}}, "success_criteria": ["..."]}}"""
-    js = call_llm(llm, prompt)
-    try:
-        plan = json.loads(js[js.find("{"): js.rfind("}")+1])
-    except Exception:
-        plan = {"subtasks": ["Research", "Synthesize"], "tools": {"search": True, "math": False}, "success_criteria": ["clear answer"]}
-    plan_str = json.dumps(plan, indent=2)
-    scratch = (state.get("scratch") or []) + ["PLAN:\n" + plan_str]
-    log.debug(f"node_plan: produced plan with {len(plan.get('subtasks', []))} subtasks")
-    return {"plan": plan_str, "scratch": scratch}
-
-def _node_route_decider(state: GraphState, llm) -> Literal["tools", "write"]:
-    log.debug("node_route_decider: deciding next node")
-    prompt = f"""You are a router. Decide next node.
-        Context scratch:\n{chr(10).join((state.get('scratch') or [])[-5:])}
-        If you want to call a specific tool -> 'tools'. If math needed -> 'math', if research needed -> 'research', if ready -> 'write'.
-        Return one token from [tools, write]. Task: {state.get('task','')}"""
-    choice = call_llm(llm, prompt).lower()
-    if "tool" in choice:
-        log.debug("node_route_decider: chose 'tools'")
-        return "tools"
-    log.debug("node_route_decider: chose 'write'")
-    return "write"
-
-def _node_write(state: GraphState, llm) -> GraphState:
-    log.debug("node_write: drafting final answer")
-    prompt = f"""Write the final answer.
-Task: {state.get('task','')}
-Use the evidence and any math results below, cite inline like [1],[2].
-Evidence:\n{chr(10).join(f'[{i+1}] '+e for i,e in enumerate(state.get('evidence') or []))}
-Notes:\n{chr(10).join((state.get('scratch') or [])[-5:])}
-Return a concise, structured answer."""
-    draft = call_llm(llm, prompt, temperature=0.3)
-    sc = (state.get("scratch") or []) + ["DRAFT:\n" + draft]
-    log.debug(f"node_write: draft length={len(draft)}")
-    return {"result": draft, "scratch": sc}
-
-
-def _node_tools(state: GraphState, llm, tools: Dict[str, Callable[[Dict[str, Any], GraphState], Dict[str, Any]]]) -> GraphState:
-    """Generic tool-calling node. LLM chooses a tool and args; we execute it.
-
-    tools: mapping of tool name -> function(args: dict, state: GraphState) -> GraphState patch
-    """
-    log.debug(f"node_tools: available={list(tools.keys())}")
-    available = list(tools.keys())
-    tool_list = ", ".join(available) if available else "(none)"
-    prompt = f"""You may call exactly one tool from the available tools or return none.
-Task: {state.get('task','')}
-Recent notes:\n{chr(10).join((state.get('scratch') or [])[-5:])}
-Available tools: {tool_list}
-Return strict JSON: {{"tool": "<name|none>", "args": {{}}}}"""
-    js = call_llm(llm, prompt)
-    try:
-        spec = json.loads(js[js.find("{"): js.rfind("}")+1])
-    except Exception as e:
-        log.debug(f"node_tools: error parsing JSON {e}")
-        spec = {"tool": "none", "args": {}}
-    tool_name = str(spec.get("tool") or "none").strip()
-    args = spec.get("args") or {}
-
-    scratch = state.get("scratch") or []
-
-    if tool_name == "none" or tool_name not in tools:
-        msg = f"TOOL: none or unavailable ({tool_name})."
-        log.debug(f"node_tools: {msg}")
-        return {"scratch": scratch + [msg]}
-
-    try:
-        tool_obj = tools[tool_name]
-        log.debug(f"node_tools: invoking '{tool_name}' with args={args}")
-
-        # Case 1: LangChain tool object: prefer async if available
-        if hasattr(tool_obj, "ainvoke") or hasattr(tool_obj, "invoke"):
-            try:
-                if hasattr(tool_obj, "ainvoke"):
-                    res = asyncio.run(tool_obj.ainvoke(args))
-                else:
-                    res = tool_obj.invoke(args)
-            except RuntimeError as re:
-                # If an event loop is already running, create a new task and wait
-                if "asyncio.run() cannot be called from a running event loop" in str(re) and hasattr(tool_obj, "ainvoke"):
-                    loop = asyncio.get_event_loop()
-                    res = loop.run_until_complete(tool_obj.ainvoke(args))
-                else:
-                    raise
-            log.debug(f"node_tools: result={str(res)[:120]}")
-            return {"scratch": scratch + [f"TOOL-CALL: {tool_name}({args}) -> {res}"]}
-
-        # Case 2: plain callable; try (args, state) first, then kwargs
-        if callable(tool_obj):
-            try:
-                res = tool_obj(args, state)
-            except TypeError:
-                try:
-                    res = tool_obj(**(args if isinstance(args, dict) else {"args": args}))
-                except Exception:
-                    res = tool_obj(args)
-
-            if isinstance(res, dict):
-                preview = json.dumps({k: res.get(k) for k in ("result", "evidence") if k in res}, ensure_ascii=False)[:300]
-                msg = f"TOOL-CALL: {tool_name}({args}) -> {preview}"
-                out = dict(res)
-                out["scratch"] = (res.get("scratch") or scratch) + [msg]
-                log.debug(f"node_tools: dict result keys={list(res.keys())}")
-                return out
-            else:
-                log.debug(f"node_tools: scalar result={str(res)[:120]}")
-                return {"scratch": scratch + [f"TOOL-CALL: {tool_name}({args}) -> {res}"]}
-
-        return {"scratch": scratch + [f"TOOL-ERROR: {tool_name} invalid tool type"]}
-    except Exception as e:
-        log.debug(f"node_tools: error calling '{tool_name}': {e}")
-        return {"scratch": scratch + [f"TOOL-ERROR: {tool_name}({args}) -> {e}"]}
 
 def _normalize_tools(tools_param: Any) -> Dict[str, Any]:
     """Accept dict, list, or tuple of tools and return name->tool mapping.
@@ -169,9 +52,9 @@ async def dosleep(seconds: int) -> str:
 
 class AgentGraph:
 
-    def __init__(self, llm, tools: Dict[str, Callable[[Dict[str, Any], GraphState], Dict[str, Any]]] | List[Any] | tuple | None = None):
+    def __init__(self, llm, mcpservers):
+        self.mcpservers = mcpservers
         self.llm = llm
-        self.tools = tools
         self.system_prompt = (
             "You are GraphAgent, a principled planner-executor. "
             "Prefer structured, concise outputs; use provided tools preferentially."
@@ -180,17 +63,101 @@ class AgentGraph:
         )
         self.llm.set_system_prompt(self.system_prompt)
     
-    def build_graph(self):
+    def _node_plan(self, state: GraphState) -> GraphState:
+        log.debug(f"node_plan: task='{state.get('task','')[:80]}'")
+        prompt = f"""Plan step-by-step to solve the user task.
+            Task: {state.get('task','')}
+            Return JSON: {{"subtasks": ["..."], "tools": {{"search": true/false, "math": true/false}}, "success_criteria": ["..."]}}"""
+        js = self.llm.call_llm(prompt)
+        try:
+            plan = json.loads(js[js.find("{"): js.rfind("}")+1])
+        except Exception:
+            plan = {"subtasks": ["write", "tools"], "success_criteria": ["clear answer"]}
+        plan_str = json.dumps(plan, indent=2)
+        scratch = (state.get("scratch") or []) + ["PLAN:\n" + plan_str]
+        log.debug(f"node_plan: produced plan with {len(plan.get('subtasks', []))} subtasks")
+        return {"plan": plan_str, "scratch": scratch}
+
+    def _node_route_decider(self, state: GraphState) -> Literal["tools", "write"]:
+        log.debug("node_route_decider: deciding next node")
+        prompt = f"""You are a router. Decide next node.
+            Context scratch:\n{chr(10).join((state.get('scratch') or [])[-5:])}
+            If you want to call a specific tool -> 'tools'. If ready -> 'write'.
+            Return one token from [tools, write]. Task: {state.get('task','')}"""
+        choice = self.llm.call_llm(prompt).lower()
+        if "tool" in choice:
+            log.debug("node_route_decider: chose 'tools'")
+            return "tools"
+        log.debug("node_route_decider: chose 'write'")
+        return "write"
+
+    def _node_write(self, state: GraphState) -> GraphState:
+        log.debug("node_write: drafting final answer")
+        prompt = f"""Write the final answer.
+    Task: {state.get('task','')}
+    Use the evidence and any math results below, cite inline like [1],[2].
+    Evidence:\n{chr(10).join(f'[{i+1}] '+e for i,e in enumerate(state.get('evidence') or []))}
+    Notes:\n{chr(10).join((state.get('scratch') or [])[-5:])}
+    Return a concise, structured answer."""
+        draft = self.llm.call_llm(prompt, temperature=0.3)
+        sc = (state.get("scratch") or []) + ["DRAFT:\n" + draft]
+        log.debug(f"node_write: draft length={len(draft)}")
+        return {"result": draft, "scratch": sc}
+
+
+    def _node_tools(self, state: GraphState, tools: Dict[str, Callable[[Dict[str, Any], GraphState], Dict[str, Any]]]) -> GraphState:
+        """Generic tool-calling node. LLM chooses a tool and args; we execute it.
+
+        tools: mapping of tool name -> function(args: dict, state: GraphState) -> GraphState patch
+        """
+        log.debug(f"node_tools: available={list(tools.keys())}")
+        available = list(tools.keys())
+        tool_list = ", ".join(available) if available else "(none)"
+        prompt = f"""You may call exactly one tool from the available tools or return none.
+    Task: {state.get('task','')}
+    Recent notes:\n{chr(10).join((state.get('scratch') or [])[-5:])}
+    Available tools: {tool_list}
+    Return strict JSON: {{"tool": "<name|none>", "args": {{}}}}"""
+        js = self.llm.call_llm(prompt)
+        try:
+            spec = json.loads(js[js.find("{"): js.rfind("}")+1])
+        except Exception as e:
+            log.debug(f"node_tools: error parsing JSON {e}")
+            spec = {"tool": "none", "args": {}}
+        tool_name = str(spec.get("tool") or "none").strip()
+        args = spec.get("args") or {}
+
+        scratch = state.get("scratch") or []
+
+        if tool_name == "none" or tool_name not in tools:
+            msg = f"TOOL: none or unavailable ({tool_name})."
+            log.debug(f"node_tools: {msg}")
+            return {"scratch": scratch + [msg]}
+
+        try:
+            tool_obj = tools[tool_name]
+            log.debug(f"node_tools: invoking '{tool_name}' with args={args}")
+
+            res = asyncio.run(tool_obj.ainvoke(args))
+            return {"scratch": scratch + [f"TOOL-CALL: {tool_name}({args}) -> {res}"]}    
+        except Exception as e:
+            log.debug(f"node_tools: error calling '{tool_name}': {e}")
+            return {"scratch": scratch + [f"TOOL-ERROR: {tool_name}({args}) -> {e}"]}
+
+    async def init(self):
+        await self._load_mcp_tools()
         g = StateGraph(GraphState)
 
         # Wrap nodes to capture llm
-        g.add_node("plan", lambda s: _node_plan(s, self.llm))
+        g.add_node("plan", lambda s: self._node_plan(s))
         # Route is a pass-through node; decision is made in conditional edges
         g.add_node("route", lambda s: s)
-        g.add_node("write", lambda s: _node_write(s, self.llm))
+        g.add_node("write", lambda s: self._node_write(s))
         # Tools node (generic tool execution)
-        tools = _normalize_tools(self.tools)
-        g.add_node("tools", lambda s: _node_tools(s, self.llm, tools))
+        all_tools = self.mcp_tools.copy()
+        all_tools.append(dosleep)
+        tools = _normalize_tools(all_tools)
+        g.add_node("tools", lambda s: self._node_tools(s, tools))
 
         g.add_edge(START, "plan")
         g.add_edge("plan", "route")
@@ -201,7 +168,7 @@ class AgentGraph:
             if s.get("done"):
                 return "end"
             # Decide next using LLM
-            choice = _node_route_decider(s, self.llm)
+            choice = self._node_route_decider(s)
             log.debug(f"router: choice={choice}")
             return choice
 
@@ -220,9 +187,13 @@ class AgentGraph:
         g.add_edge("write", END)
         return g.compile()
 
-    
-    def run(self, task: str):
-        app = self.build_graph()
+    async def _load_mcp_tools(self):
+        self.mcp_client = MultiServerMCPClient(connections=self.mcpservers)
+        tools = await self.mcp_client.get_tools()
+        self.mcp_tools = tools
+
+    async def run(self, task: str):
+        app = await self.init()
         init: GraphState = {
                 "task": task,
                 "plan": "",

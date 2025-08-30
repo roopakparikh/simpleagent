@@ -3,11 +3,16 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+import signal
 import logging
-from simpleagent.cli import get_prog_name, CLI
+from simpleagent.repl import get_prog_name, REPL
 from simpleagent import ConfigManager, ConfigError
 from simpleagent.model import LLM
 import asyncio
+import nest_asyncio
+nest_asyncio.apply()
+
+log = logging.getLogger("main")
 
 def configure_logging(log_level: str):
     """Configure logging for the application.
@@ -20,7 +25,6 @@ def configure_logging(log_level: str):
     
     # Configure root logger
     logging.basicConfig(
-        level=numeric_level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
         stream=sys.stderr,
@@ -29,8 +33,10 @@ def configure_logging(log_level: str):
     # Set log levels for specific loggers
     loggers = [
         'simpleagent',
-        'langchain',
-        'langchain_mcp_adapters'
+        'simpleagent.model',
+        'simpleagent.graph'
+        #'langchain',
+        #'langchain_mcp_adapters'
     ]
     
     for logger_name in loggers:
@@ -55,17 +61,24 @@ def parse_args(prog, argv: list[str] | None = None) -> argparse.Namespace:
         type=str,
         help="Root directory used for '@' file path autocompletion.",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug level logging",
+    )
     return parser.parse_args(argv)
+
 
 
 async def main(argv: list[str] | None = None) -> int:
     prog = get_prog_name()
-    args = parse_args(argv)
-    log = logging.getLogger("main")
+    args = parse_args(prog, argv)
+    # Configure logging early based on --debug
+    configure_logging("debug" if args.debug else "info")
     try:
         log.info("Loading configuration from %s", args.config)
         cfgmgr = ConfigManager(args.config)
-        cfg =cfgmgr.load_config()
+        cfg = cfgmgr.load_config()
     except ConfigError as e:
         logging.error("Failed to load configuration: %s", e)
         return 2
@@ -76,10 +89,36 @@ async def main(argv: list[str] | None = None) -> int:
     llm = LLM(cfg.model.provider, cfg.model.name, cfg.model.max_tokens)
     log.info("model loaded")
     
-    cli = CLI(prog, llm, cfg, args.root)
+    cli = REPL(prog, llm, cfg, args.root)
+    await cli.init()
     await cli.run()
     return 0
 
+async def shutdown(loop):
+    print("Shutting down...")
+    tasks = [t for t in asyncio.all_tasks(loop=loop) if t is not asyncio.current_task(loop=loop)]
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    loop.stop()
+
+def custom_exception_handler(loop, context):
+    exception = context.get("exception")
+    if isinstance(exception, SystemExit) and exception.code == 0:
+        log.debug("Ignoring SystemExit(0) for background task.")
+        pass
+    else:
+        loop.default_exception_handler(context)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    loop.set_exception_handler(custom_exception_handler)
+    loop.add_signal_handler(signal.SIGINT, lambda: asyncio.create_task(shutdown(loop)))
+    try:
+        loop.run_until_complete(main())
+    except SystemExit:
+        pass
+    except asyncio.CancelledError:
+        pass # Expected during shutdown
+    finally:
+        loop.close()
