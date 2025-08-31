@@ -5,45 +5,71 @@ from pathlib import Path
 import sys
 import signal
 import logging
+import os
+import subprocess
+from asyncio import subprocess as aio_subprocess
 from simpleagent.repl import get_prog_name, REPL
 from simpleagent import ConfigManager, ConfigError
 from simpleagent.model import LLM
+from simpleagent.ui import SimpleAgentUI
+import threading
+from simpleagent.ui.pathcompleter import AtPathSuggester, DictAutocompleteProvider, CompositeAutocompleteProvider
+
 import asyncio
 import nest_asyncio
 nest_asyncio.apply()
 
 log = logging.getLogger("main")
 
+
 def configure_logging(log_level: str):
-    """Configure logging for the application.
-    
+    """Configure logging to a file instead of the UI.
+
     Args:
         log_level: The log level to use (debug, info, warning, error, critical).
+        ui_instance: Unused; kept for backward compatibility with existing calls.
     """
     # Convert string log level to logging constant
     numeric_level = getattr(logging, log_level.upper(), logging.INFO)
-    
+
+    # File handler writes logs to the project directory (absolute path)
+    log_file = str(Path.cwd() / 'simpleagent.log')
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(numeric_level)
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+
     # Configure root logger
-    logging.basicConfig(
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S',
-        stream=sys.stderr,
-    )
+    root_logger = logging.getLogger()
+    root_logger.setLevel(numeric_level)
+    # Clear any existing handlers
+    root_logger.handlers.clear()
+    # Add file handler
+    root_logger.addHandler(file_handler)
     
-    # Set log levels for specific loggers
+    # Set log levels and propagation for specific loggers (including MCP libs)
     loggers = [
         'simpleagent',
         'simpleagent.model',
-        'simpleagent.graph'
-        #'langchain',
-        #'langchain_mcp_adapters'
+        'simpleagent.graph',
+        'langchain_mcp_adapters',
+        'mcp',
+        'mcp.server',
+        'mcp.client',
     ]
-    
+
     for logger_name in loggers:
         logger = logging.getLogger(logger_name)
         logger.setLevel(numeric_level)
+        # Remove any pre-existing handlers that could print to console
+        logger.handlers.clear()
+        # Ensure they propagate to root so our file handler captures them
+        logger.propagate = True
     
-    logging.info(f"Logging configured with level: {log_level.upper()}")
+    logging.info(f"Logging configured with level: {log_level.upper()} -> {log_file}")
+
 
 
 def parse_args(prog, argv: list[str] | None = None) -> argparse.Namespace:
@@ -71,9 +97,16 @@ def parse_args(prog, argv: list[str] | None = None) -> argparse.Namespace:
 
 
 async def main(argv: list[str] | None = None) -> int:
+
+
     prog = get_prog_name()
+    # Wait for UI ready (so handler won’t hit uninitialized attributes)
+    
     args = parse_args(prog, argv)
-    # Configure logging early based on --debug
+
+
+    
+    # Configure logging after UI is ready
     configure_logging("debug" if args.debug else "info")
     try:
         log.info("Loading configuration from %s", args.config)
@@ -88,10 +121,23 @@ async def main(argv: list[str] | None = None) -> int:
     log.info("Loading model")
     llm = LLM(cfg.model.provider, cfg.model.name, cfg.model.max_tokens)
     log.info("model loaded")
-    
-    cli = REPL(prog, llm, cfg, args.root)
+
+
+    pathProvider=AtPathSuggester(args.root)
+    cmdProvider=DictAutocompleteProvider("/", {"help", "quit", "exit"})
+    autoCompleteProvider=CompositeAutocompleteProvider([pathProvider, cmdProvider])
+    ui = SimpleAgentUI(prog,autoCompleteProvider)
+    # Start UI asynchronously and wait for mount before logging
+
+
+    cli = REPL(prog, llm, cfg, args.root, ui)
     await cli.init()
     await cli.run()
+
+    ui.run()
+    if getattr(ui, "ready_event", None) is not None:
+        await ui.ready_event.wait()
+
     return 0
 
 async def shutdown(loop):

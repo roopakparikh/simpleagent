@@ -105,44 +105,88 @@ class AgentGraph:
         return {"result": draft, "scratch": sc}
 
 
-    def _node_tools(self, state: GraphState, tools: Dict[str, Callable[[Dict[str, Any], GraphState], Dict[str, Any]]]) -> GraphState:
-        """Generic tool-calling node. LLM chooses a tool and args; we execute it.
-
-        tools: mapping of tool name -> function(args: dict, state: GraphState) -> GraphState patch
+    async def _node_tools(self, state: GraphState, tools: Dict[str, Any]) -> GraphState:
+        """Async tool-calling node that supports both MCP/LangChain tools and local callables.
+        
+        Handles long-running tools by making the entire node async.
         """
         log.debug(f"node_tools: available={list(tools.keys())}")
         available = list(tools.keys())
         tool_list = ", ".join(available) if available else "(none)"
+        
+        # Check if we've made too many tool calls without progress
+        step = state.get("step", 0) + 1
+        if step > 10:
+            log.debug("node_tools: too many steps, forcing write")
+            return {"scratch": (state.get("scratch") or []) + ["MAX_STEPS: Forcing completion"], "done": True, "step": step}
+        
         prompt = f"""You may call exactly one tool from the available tools or return none.
     Task: {state.get('task','')}
     Recent notes:\n{chr(10).join((state.get('scratch') or [])[-5:])}
     Available tools: {tool_list}
+    Step: {step}/10
     Return strict JSON: {{"tool": "<name|none>", "args": {{}}}}"""
         js = self.llm.call_llm(prompt)
         try:
-            spec = json.loads(js[js.find("{"): js.rfind("}")+1])
+            spec = json.loads(js[js.find("{"):js.rfind("}")+1])
         except Exception as e:
             log.debug(f"node_tools: error parsing JSON {e}")
             spec = {"tool": "none", "args": {}}
         tool_name = str(spec.get("tool") or "none").strip()
         args = spec.get("args") or {}
 
-        scratch = state.get("scratch") or []
+        scratch = (state.get("scratch") or []) + [f"STEP-{step}: Considering tool '{tool_name}'"]
 
         if tool_name == "none" or tool_name not in tools:
-            msg = f"TOOL: none or unavailable ({tool_name})."
+            msg = f"TOOL: none or unavailable ({tool_name}). Moving to write."
             log.debug(f"node_tools: {msg}")
-            return {"scratch": scratch + [msg]}
+            return {"scratch": scratch + [msg], "done": True, "step": step}
 
         try:
             tool_obj = tools[tool_name]
             log.debug(f"node_tools: invoking '{tool_name}' with args={args}")
 
-            res = asyncio.run(tool_obj.ainvoke(args))
-            return {"scratch": scratch + [f"TOOL-CALL: {tool_name}({args}) -> {res}"]}    
+            # Case A: LangChain/MCP tool (async)
+            if hasattr(tool_obj, "ainvoke"):
+                res = await tool_obj.ainvoke(args)
+                log.debug(f"node_tools: async result={str(res)[:200]}")
+                return {"scratch": scratch + [f"TOOL-CALL: {tool_name}({args}) -> {res}"], "step": step}
+            
+            # Case B: LangChain/MCP tool (sync)
+            elif hasattr(tool_obj, "invoke"):
+                res = tool_obj.invoke(args)
+                log.debug(f"node_tools: sync result={str(res)[:200]}")
+                return {"scratch": scratch + [f"TOOL-CALL: {tool_name}({args}) -> {res}"], "step": step}
+            
+            # Case C: Local callable
+            elif callable(tool_obj):
+                try:
+                    # Try async first
+                    if asyncio.iscoroutinefunction(tool_obj):
+                        res = await tool_obj(args, state)
+                    else:
+                        res = tool_obj(args, state)
+                except TypeError:
+                    # Fallback patterns
+                    if asyncio.iscoroutinefunction(tool_obj):
+                        res = await tool_obj(**args if isinstance(args, dict) else {"args": args})
+                    else:
+                        res = tool_obj(**args if isinstance(args, dict) else {"args": args})
+                
+                if isinstance(res, dict):
+                    out = dict(res)
+                    out["scratch"] = (res.get("scratch") or scratch) + [f"TOOL-CALL: {tool_name}({args}) -> dict result"]
+                    out["step"] = step
+                    return out
+                else:
+                    return {"scratch": scratch + [f"TOOL-CALL: {tool_name}({args}) -> {res}"], "step": step}
+            
+            else:
+                return {"scratch": scratch + [f"TOOL-ERROR: {tool_name} invalid tool type"], "step": step}
+                
         except Exception as e:
             log.debug(f"node_tools: error calling '{tool_name}': {e}")
-            return {"scratch": scratch + [f"TOOL-ERROR: {tool_name}({args}) -> {e}"]}
+            return {"scratch": scratch + [f"TOOL-ERROR: {tool_name}({args}) -> {e}"], "step": step}
 
     async def init(self):
         await self._load_mcp_tools()
@@ -157,19 +201,29 @@ class AgentGraph:
         all_tools = self.mcp_tools.copy()
         all_tools.append(dosleep)
         tools = _normalize_tools(all_tools)
-        g.add_node("tools", lambda s: self._node_tools(s, tools))
+        # For async nodes in LangGraph, we need to make the wrapper async
+        async def tools_wrapper(s):
+            return await self._node_tools(s, tools)
+        g.add_node("tools", tools_wrapper)
 
         g.add_edge(START, "plan")
         g.add_edge("plan", "route")
 
         # Router as conditional edges from a lightweight node name "route"
         def router(s: GraphState) -> Literal["tools", "write", "end"]:
-            # Use the same logic as before; if done or have result -> critic
-            if s.get("done"):
+            # Check termination conditions first
+            if s.get("done") or s.get("result"):
                 return "end"
+            
+            # Check step limit to prevent infinite loops
+            step = s.get("step", 0)
+            if step >= 8:  # Lower limit to prevent recursion
+                log.debug(f"router: step limit reached ({step}), forcing write")
+                return "write"
+            
             # Decide next using LLM
             choice = self._node_route_decider(s)
-            log.debug(f"router: choice={choice}")
+            log.debug(f"router: choice={choice} (step={step})")
             return choice
 
         g.add_conditional_edges(
@@ -185,7 +239,7 @@ class AgentGraph:
         # After work nodes, go back to router or to critic
         g.add_edge("tools", "route")
         g.add_edge("write", END)
-        return g.compile()
+        return g.compile(checkpointer=None, interrupt_before=[], interrupt_after=[], debug=False)
 
     async def _load_mcp_tools(self):
         self.mcp_client = MultiServerMCPClient(connections=self.mcpservers)
@@ -203,6 +257,6 @@ class AgentGraph:
                 "step": 0,
                 "done": False,
         }
-        # Single-shot to the END state; internal routing handles steps
-        out: GraphState = app.invoke(init)
+        # Use async invoke for async nodes
+        out: GraphState = await app.ainvoke(init)
         return out.get('result', '')

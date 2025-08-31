@@ -9,6 +9,11 @@
       "command": "uv",
       "args": ["--directory", "/Users/rparikh/personal/deepagents/", "run", "sampleserver.py"],
       "transport": "stdio"
+    },
+    "gene-analysis" : {
+      "command": "uv",
+      "args": ["--directory", "/Users/rparikh/personal/deepagents/", "run", "longrun.py"],
+      "transport": "stdio"
     }
  }
 }
