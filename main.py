@@ -78,8 +78,8 @@ def parse_args(prog, argv: list[str] | None = None) -> argparse.Namespace:
 
     parser.add_argument(
         "--config",
-        required=True,
         help=f"Path to configuration JSON file (default {default_cfg_path})",
+        default=default_cfg_path
     )
     parser.add_argument(
         "--root",
@@ -104,11 +104,11 @@ async def main(argv: list[str] | None = None) -> int:
     
     args = parse_args(prog, argv)
 
-
-    
     # Configure logging after UI is ready
     configure_logging("debug" if args.debug else "info")
     try:
+        if not args.config:
+            args.config = Path.home() / f".{prog}" / "config.json"
         log.info("Loading configuration from %s", args.config)
         cfgmgr = ConfigManager(args.config)
         cfg = cfgmgr.load_config()
