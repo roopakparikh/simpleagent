@@ -22,7 +22,7 @@ nest_asyncio.apply()
 log = logging.getLogger("main")
 
 
-def configure_logging(log_level: str):
+def configure_logging(log_level: str, prog_name: str):
     """Configure logging to a file instead of the UI.
 
     Args:
@@ -33,7 +33,7 @@ def configure_logging(log_level: str):
     numeric_level = getattr(logging, log_level.upper(), logging.INFO)
 
     # File handler writes logs to the project directory (absolute path)
-    log_file = str(Path.cwd() / 'simpleagent.log')
+    log_file = str(Path.cwd() / f'{prog_name}.log')
     file_handler = logging.FileHandler(log_file, encoding='utf-8')
     file_handler.setLevel(numeric_level)
     file_handler.setFormatter(logging.Formatter(
@@ -105,7 +105,7 @@ async def main(argv: list[str] | None = None) -> int:
     args = parse_args(prog, argv)
 
     # Configure logging after UI is ready
-    configure_logging("debug" if args.debug else "info")
+    configure_logging("debug" if args.debug else "info", prog)
     try:
         if not args.config:
             args.config = Path.home() / f".{prog}" / "config.json"
