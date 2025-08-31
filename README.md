@@ -1,7 +1,5 @@
 # simpleagent
 
-[![Create Release](https://github.com/roopakparikh/simpleagent/actions/workflows/main.yaml/badge.svg)](https://github.com/roopakparikh/simpleagent/actions/workflows/main.yaml)
-
 A lightweight CLI/TUI agent framework with path-aware autocomplete and optional MCP (Model Context Protocol) tool integration. Includes a Textual-based UI, logging to file, and packaging via PyInstaller.
 
 ## Features
